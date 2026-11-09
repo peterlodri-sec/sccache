@@ -145,6 +145,35 @@ fn check_jwt_server_token(
         .ok()
 }
 
+fn open_fds() -> HashSet<std::os::fd::RawFd> {
+    snapshot_fds(std::fs::read_dir("/dev/fd").or_else(|_| std::fs::read_dir("/proc/self/fd")))
+}
+
+fn snapshot_fds(listing: io::Result<std::fs::ReadDir>) -> HashSet<std::os::fd::RawFd> {
+    let candidates = listing.and_then(|entries| {
+        entries
+            .map(|entry| {
+                Ok(entry?
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse::<i32>().ok()))
+            })
+            .collect::<io::Result<Vec<_>>>()
+    });
+    let mut fds: HashSet<_> = match candidates {
+        Ok(fds) => fds.into_iter().flatten().collect(),
+        Err(_) => {
+            // Match close_inherited_fds when no descriptor filesystem is mounted.
+            let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+            let max = if max < 0 { 4096 } else { max.min(65536) as i32 };
+            (3..max).collect()
+        }
+    };
+    // The enumeration directory's descriptor is closed before validating the snapshot.
+    fds.retain(|fd| *fd > libc::STDERR_FILENO && unsafe { libc::fcntl(*fd, libc::F_GETFD) } != -1);
+    fds
+}
+
 fn run(command: Command) -> Result<i32> {
     match command {
         Command::Auth(AuthSubcommand::Base64 { num_bytes }) => {
@@ -171,6 +200,7 @@ fn run(command: Command) -> Result<i32> {
             client_auth,
             server_auth,
         }) => {
+            let mut preserve_fds = Vec::new();
             let check_client_auth: Box<dyn dist::http::ClientAuthCheck> = match client_auth {
                 scheduler_config::ClientAuth::Insecure => Box::new(token_check::EqCheck::new(
                     INSECURE_DIST_CLIENT_TOKEN.to_owned(),
@@ -183,13 +213,18 @@ fn run(command: Command) -> Result<i32> {
                     issuer,
                     jwks_url,
                 } => {
-                    // Finish JWK retrieval and drop its runtime before daemonizing.
-                    let checker = tokio::runtime::Builder::new_current_thread()
+                    let before = open_fds();
+                    let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
-                        .context("Failed to create Tokio runtime")?
+                        .context("Failed to create Tokio runtime")?;
+                    let checker = runtime
                         .block_on(token_check::ValidJWTCheck::new(audience, issuer, &jwks_url))
                         .context("Failed to create a checker for valid JWTs")?;
+                    drop(runtime);
+                    // Tokio's global signal sockets outlive the runtime. Keep those, not
+                    // inherited build descriptors, usable by the post-daemonization runtime.
+                    preserve_fds.extend(open_fds().difference(&before).copied());
                     Box::new(checker)
                 }
                 scheduler_config::ClientAuth::ProxyToken { url, cache_secs } => Box::new(
@@ -227,7 +262,7 @@ fn run(command: Command) -> Result<i32> {
                 }
             };
 
-            daemonize(&[])?;
+            daemonize(&preserve_fds)?;
             let scheduler = Scheduler::new();
             let http_scheduler = dist::http::Scheduler::new(
                 public_addr,
@@ -901,6 +936,18 @@ impl ServerIncoming for Server {
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
+
+    #[test]
+    fn fd_snapshot_without_descriptor_filesystem_preserves_open_sockets() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (reader, writer) = UnixStream::pair().unwrap();
+        let fds = snapshot_fds(Err(io::ErrorKind::NotFound.into()));
+        assert!(fds.contains(&reader.as_raw_fd()));
+        assert!(fds.contains(&writer.as_raw_fd()));
+        assert!(fds.iter().all(|fd| *fd > libc::STDERR_FILENO));
+    }
 
     #[test]
     fn scheduler_instances_namespace_job_ids() {
